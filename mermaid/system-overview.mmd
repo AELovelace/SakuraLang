@@ -1,0 +1,81 @@
+---
+title: SakuraLang — System Overview
+---
+graph TB
+    subgraph TUI["Terminal UI (curses)"]
+        direction TB
+        Home["Home View\n(welcome / shortcuts)"]
+        Chat["Chat View\n(history + input + monitor)"]
+        Settings["Settings View\n(live editable config)"]
+        ChatsModal["Chats Modal (F2)\n(list / switch / new / delete threads)"]
+    end
+
+    subgraph App["App Class"]
+        direction TB
+        EventLoop["Event Loop\n1s getch timeout"]
+        StreamWorker["_stream_worker()\nBackground Thread"]
+        DrainQueue["_drain_queue()\nConsume streaming events"]
+        MonitorThread["_monitor_thread()\nPoll system metrics (1s)"]
+        LogThread["_log_thread()\nPoll inference logs (1s)"]
+    end
+
+    subgraph Graph["LangGraph StateGraph"]
+        direction TB
+        Classify["classify node"]
+        Route["route() conditional"]
+        Rag["rag node\nHybrid RAG pipeline"]
+        Respond["respond node"]
+        ToolNode["tools / dispatch_text_tools"]
+        Summarize["summarize node"]
+    end
+
+    subgraph RAG["Hybrid RAG (rag.py, local)"]
+        direction TB
+        Embed["Embeddings\nBAAI/bge-small-en-v1.5"]
+        Qdrant[("Qdrant\non-disk vectors")]
+        BM25["BM25\nkeyword/sparse"]
+        Rerank["CrossEncoder\nreranker"]
+        IndexDir[(".sakura_rag/\nper-cwd index")]
+    end
+
+    subgraph External["External Services (configurable)"]
+        AgentLLM["Agent LLM\n:9090/v1"]
+        ResearcherLLM["Researcher LLM (Qwen)\n100.83.3.32:9090/v1"]
+        ClassifierLLM["Classifier LLM\n:9091/v1"]
+        MonitorAPI["Monitor API\n:8086/api/sakura/monitor"]
+        LogsAPI["Logs API\n:8086/api/sakura/logs"]
+    end
+
+    subgraph Persistence["Persistence"]
+        SQLite[("chat_history.db\nSQLite / LangGraph\nCheckpoint Store")]
+        SettingsJSON[("settings.json\nRuntime Config")]
+    end
+
+    subgraph Tools["Agent Tools"]
+        PS["run_powershell\n(15s timeout)"]
+        PY["run_python\n(15s timeout)"]
+        Launch["launch_app\n(detached process)"]
+    end
+
+    User(["👤 User"]) <-->|"keyboard / screen"| TUI
+    TUI <--> App
+    App <-->|"graph.stream()"| Graph
+    Graph -->|"classify"| ClassifierLLM
+    Graph -->|"respond"| AgentLLM
+    Graph -->|"rag: rewrite + grounded answer"| ResearcherLLM
+    Graph -->|"rag: retrieve"| RAG
+    RAG --> IndexDir
+    Graph <--> SQLite
+    Graph --> Tools
+    App -->|"poll"| MonitorAPI
+    App -->|"poll"| LogsAPI
+    App <--> SettingsJSON
+
+    style User fill:#ffb7c5,stroke:#cc7088,color:#000
+    style TUI fill:#ffe0f0,stroke:#cc88aa,color:#000
+    style App fill:#e8d5ff,stroke:#9966cc,color:#000
+    style Graph fill:#d5e8ff,stroke:#6699cc,color:#000
+    style External fill:#fff3cd,stroke:#cc9900,color:#000
+    style RAG fill:#ffe0b3,stroke:#cc9966,color:#000
+    style Persistence fill:#d5f5e3,stroke:#27ae60,color:#000
+    style Tools fill:#d5f5e3,stroke:#27ae60,color:#000

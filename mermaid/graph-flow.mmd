@@ -1,0 +1,47 @@
+---
+title: SakuraLang — LangGraph State Machine
+---
+flowchart TD
+    START(["▶ START"]) --> classify
+
+    classify["**classify**\nClassifier LLM → JSON\nintent / domain / confidence\nrag_needed / tools_needed"]
+
+    classify --> route{"**route()**\nconfidence?"}
+
+    route -->|"conf < 0.65"| clarify
+    route -->|"rag_needed"| rag
+    route -->|"respond"| respond
+
+    clarify["**clarify**\nAsk one\nclarifying question"]
+    clarify --> END1(["⏹ END"])
+
+    rag["**rag**\nQuery rewrite (Qwen)\n→ Hybrid retrieve (dense+BM25/RRF)\n→ rerank → small-to-big\n→ compress → rag_context"]
+    rag --> respond
+
+    respond["**respond**\nrag_context? → Qwen (grounded)\nelse Agent LLM + tools\n+ domain system prompt"]
+
+    respond --> after{"**_after_respond()**\ntool calls?"}
+
+    after -->|"structured\ntool_calls"| tools
+    after -->|"XML &lt;tool_call&gt;"| dispatch
+    after -->|"done"| summarize
+
+    tools["**tools**\nToolNode\nrun_powershell\nrun_python\nlaunch_app"]
+    tools --> respond
+
+    dispatch["**dispatch_text_tools**\nParse XML blocks\nExecute tools\nStrip XML from message"]
+    dispatch --> respond
+
+    summarize["**summarize**\nIf messages &gt; 40:\ncompress oldest messages\nkeep last 20 in window"]
+    summarize --> END2(["⏹ END"])
+
+    style START fill:#ffb7c5,stroke:#cc7088,color:#000
+    style END1  fill:#ffb7c5,stroke:#cc7088,color:#000
+    style END2  fill:#ffb7c5,stroke:#cc7088,color:#000
+    style classify fill:#d9b3ff,stroke:#9966cc,color:#000
+    style respond   fill:#b3d9ff,stroke:#6699cc,color:#000
+    style tools     fill:#b3ffcc,stroke:#66cc88,color:#000
+    style dispatch  fill:#b3ffcc,stroke:#66cc88,color:#000
+    style clarify   fill:#ffe0b3,stroke:#cc9966,color:#000
+    style rag       fill:#ffe0b3,stroke:#cc9966,color:#000
+    style summarize fill:#e0e0e0,stroke:#999999,color:#000

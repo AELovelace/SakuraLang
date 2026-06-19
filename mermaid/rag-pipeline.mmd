@@ -1,0 +1,44 @@
+---
+title: SakuraLang — Hybrid RAG Pipeline (rag.py)
+---
+flowchart TD
+    User(["User request"]) --> Classify["classify node\nrag_needed = true"]
+    Classify --> Rewrite["Query rewrite (Qwen)\nraw prompt → keyword-rich search query\nkeeps IDs / codes / IPs / PLUs verbatim"]
+
+    Rewrite --> Ensure{"index fresh?\n(signature check)"}
+    Ensure -->|"stale / missing"| Build["BUILD\nwalk cwd → chunk by file type\nsmall children + parent sections\nembed → Qdrant • index → BM25"]
+    Ensure -->|"unchanged"| Load["LOAD persisted index\n.sakura_rag/ (no re-embed)"]
+    Build --> Retrieve
+    Load --> Retrieve
+
+    subgraph Hybrid["Hybrid retrieval"]
+        direction LR
+        Dense["Dense / vector\nbge-small embeddings\ntop 20"]
+        Sparse["Sparse / BM25\nkeyword match\ntop 20"]
+        Dense --> Fuse["RRF fusion\nreciprocal rank fusion"]
+        Sparse --> Fuse
+    end
+
+    Retrieve["retrieve(query)"] --> Hybrid
+    Fuse --> Rerank["Rerank\nCrossEncoder ms-marco-MiniLM\ntop 20 → top 5"]
+    Rerank --> SmallBig["Small-to-big\nswap matched child chunk\nfor its parent section"]
+    SmallBig --> Compress["Compress\ngreedily pack parents\n≤ ~1500 tokens"]
+    Compress --> Context[["rag_context"]]
+
+    Context --> Respond["respond node\nQwen answers grounded\nONLY in retrieved context"]
+    Respond --> Answer(["Answer + sources"])
+
+    %% chunking note
+    Chunking["Chunk size by type:\nmanuals 500–900 tok • logs 50–200 lines\nconfigs per section • code per fn/class\nCSV/inventory per entity"]
+    Build -.-> Chunking
+
+    style User fill:#ffb7c5,stroke:#cc7088,color:#000
+    style Answer fill:#ffb7c5,stroke:#cc7088,color:#000
+    style Rewrite fill:#d9b3ff,stroke:#9966cc,color:#000
+    style Respond fill:#b3d9ff,stroke:#6699cc,color:#000
+    style Hybrid fill:#fff3cd,stroke:#cc9900,color:#000
+    style Rerank fill:#ffe0b3,stroke:#cc9966,color:#000
+    style SmallBig fill:#ffe0b3,stroke:#cc9966,color:#000
+    style Compress fill:#ffe0b3,stroke:#cc9966,color:#000
+    style Context fill:#b3ffcc,stroke:#66cc88,color:#000
+    style Chunking fill:#eeeeee,stroke:#999999,color:#000

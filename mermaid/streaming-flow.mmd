@@ -1,0 +1,43 @@
+---
+title: SakuraLang — Streaming Event Flow
+---
+sequenceDiagram
+    actor User
+    participant TUI as curses TUI
+    participant App
+    participant Queue as stream_queue
+    participant Worker as _stream_worker<br/>(Thread)
+    participant Graph as LangGraph
+    participant LLM as Agent LLM
+
+    User->>TUI: press Enter
+    TUI->>App: _send(text)
+    App->>App: append (user, text) to history
+    App->>App: thinking = True
+    App->>Worker: spawn daemon thread
+    App->>TUI: _redraw()
+
+    loop graph.stream()
+        Worker->>Graph: stream HumanMessage
+        Graph->>LLM: classify + respond
+        LLM-->>Worker: AIMessageChunk (token)
+        Worker->>Queue: put("ai_start" / "ai_append", token)
+        Worker->>Queue: put("classify", routing_note)
+    end
+
+    loop curses event loop (1s timeout)
+        App->>Queue: _drain_queue()
+        Queue-->>App: events
+        App->>TUI: update history + redraw
+    end
+
+    Worker->>Queue: put("done")
+    App->>App: thinking = False
+    App->>TUI: final redraw
+
+    opt ESC pressed during inference
+        User->>TUI: ESC key
+        App->>Worker: _cancel_event.set()
+        App->>App: thinking = False (immediately)
+        App->>Queue: _flush_queue() — discard pending
+    end
