@@ -5,6 +5,7 @@ import os
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
 DEFAULT_SETTINGS = {
+    "mode": "auto",   # auto | agent | plan | chat
     "agent": {
         "address": "http://100.66.64.45:9090/v1",
         "system_prompt": "",
@@ -76,6 +77,8 @@ def load_settings() -> dict:
         for section in ("agent", "researcher", "brave", "classifier", "titler", "lovense"):
             if section in data:
                 result[section].update(data[section])
+        if "mode" in data and data["mode"] in ("auto", "agent", "plan", "chat"):
+            result["mode"] = data["mode"]
         return result
     except (FileNotFoundError, json.JSONDecodeError):
         return json.loads(json.dumps(DEFAULT_SETTINGS))

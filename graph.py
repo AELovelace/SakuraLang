@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
+from copy import deepcopy
+
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, RemoveMessage
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 
+import approval
 from settings import SETTINGS
 from state import AgentState
 from llm import get_llm
 from tools import (
-    TOOLS, TOOL_MAP,
+    TOOLS, TOOL_MAP, PLAN_TOOLS, PLAN_TOOL_NAMES,
     _contains_text_tool_call, _contains_context_override,
     _extract_context_override, _parse_text_tool_calls,
     _extract_json, _fallback_research_brief, _search_brave,
@@ -21,6 +24,7 @@ from prompts import (
     SUMMARIZE_PROMPT, QUERY_REWRITE_PROMPT, WEB_QUERY_REWRITE_PROMPT,
     WEB_RESEARCH_BRIEF_PROMPT,
     CLASSIFIER_RETRY_MSG, CLASSIFIER_CONFIDENCE_RETRY_MSG,
+    CHAT_MODE_SYSTEM, PLAN_MODE_SYSTEM,
 )
 
 
@@ -123,6 +127,8 @@ def classify(state: AgentState) -> dict:
 
 
 def route(state: AgentState) -> str:
+    if SETTINGS.get("mode", "auto") in ("chat", "plan"):
+        return "respond"  # bypass classifier routing — model calls tools directly if needed
     conf = state.get("confidence", 0.0)
     if conf <= 0.0:
         return "respond"  # classifier failed completely — just answer
@@ -368,6 +374,32 @@ def _invoke_main_agent(state: AgentState, extra_brief: str = ""):
 
 
 def respond(state: AgentState) -> dict:
+    mode = SETTINGS.get("mode", "auto")
+    if mode == "chat":
+        cfg = SETTINGS["agent"]
+        llm = get_llm(cfg["address"])   # no tools — pure conversation
+        summary = state.get("summary", "")
+        msgs: list = [SystemMessage(content=CHAT_MODE_SYSTEM)]
+        if summary:
+            msgs.append(SystemMessage(content=f"Earlier conversation summary:\n{summary}"))
+        msgs.extend(state["messages"][-WINDOW_SIZE:])
+        return {"messages": [llm.invoke(msgs)]}
+    if mode == "plan":
+        cfg = SETTINGS["agent"]
+        # Plan mode gets web search only — no shell, no file writes.
+        llm = get_llm(cfg["address"]).bind_tools(PLAN_TOOLS)
+        summary = state.get("summary", "")
+        msgs: list = [SystemMessage(content=_build_sys_prompt(PLAN_MODE_SYSTEM, state))]
+        msgs.extend(state["messages"][-WINDOW_SIZE:])
+        response = llm.invoke(msgs)
+        research_brief = state.get("research_brief", "").strip()
+        content = response.content if isinstance(response.content, str) else ""
+        keep_brief = bool(getattr(response, "tool_calls", None)) or _contains_text_tool_call(content)
+        result = {"messages": [response]}
+        if research_brief and not keep_brief:
+            result.update({"research_brief": "", "web_query": "", "web_results": []})
+        return result
+
     # If the RAG node retrieved context, answer with the Qwen researcher grounded
     # strictly in that context (no tools — it's a pure synthesis-from-context step).
     rag_context = state.get("rag_context", "")
@@ -422,11 +454,29 @@ def summarize(state: AgentState) -> dict:
 
 def dispatch_text_tools(state: AgentState) -> dict:
     """Execute tool calls embedded as <tool_call> XML in the AI's text response."""
+    mode       = SETTINGS.get("mode", "auto")
+    agent_mode = mode == "agent"
+    plan_mode  = mode == "plan"
     last    = state["messages"][-1]
     content = getattr(last, "content", "") or ""
     calls   = _parse_text_tool_calls(content)
     results = []
     for call in calls:
+        if plan_mode and call["name"] not in PLAN_TOOL_NAMES:
+            results.append(ToolMessage(
+                content=f"[Tool '{call['name']}' is not available in Plan mode]",
+                name=call["name"],
+                tool_call_id=call["name"],
+            ))
+            continue
+        if agent_mode:
+            if not approval.request_approval(call["name"], call["args"]):
+                results.append(ToolMessage(
+                    content="[Tool call rejected by user]",
+                    name=call["name"],
+                    tool_call_id=call["name"],
+                ))
+                continue
         fn = TOOL_MAP.get(call["name"])
         if fn:
             try:
@@ -492,6 +542,54 @@ def _after_respond(state: AgentState) -> str:
     return "summarize"
 
 
+_TOOL_NODE_ALL  = ToolNode(TOOLS)
+_TOOL_NODE_PLAN = ToolNode(PLAN_TOOLS)
+
+
+def _tools_node(state: AgentState) -> dict:
+    """ToolNode wrapper that gates structured tool calls in agent/plan modes."""
+    mode = SETTINGS.get("mode", "auto")
+    if mode not in ("agent", "plan"):
+        return _TOOL_NODE_ALL.invoke(state)
+
+    last = state["messages"][-1]
+    tool_calls = getattr(last, "tool_calls", None) or []
+    if not tool_calls:
+        return _TOOL_NODE_ALL.invoke(state)
+
+    approved_calls = []
+    rejected_msgs  = []
+    for tc in tool_calls:
+        name = tc["name"]
+        if mode == "plan" and name not in PLAN_TOOL_NAMES:
+            rejected_msgs.append(ToolMessage(
+                content=f"[Tool '{name}' is not available in Plan mode]",
+                tool_call_id=tc["id"],
+                name=name,
+            ))
+            continue
+        if mode == "agent":
+            if not approval.request_approval(name, tc.get("args", {})):
+                rejected_msgs.append(ToolMessage(
+                    content="[Tool call rejected by user]",
+                    tool_call_id=tc["id"],
+                    name=name,
+                ))
+                continue
+        approved_calls.append(tc)
+
+    if not approved_calls:
+        return {"messages": rejected_msgs}
+
+    filtered            = deepcopy(last)
+    filtered.tool_calls = approved_calls
+    sub_state           = {**state, "messages": state["messages"][:-1] + [filtered]}
+    node                = _TOOL_NODE_PLAN if mode == "plan" else _TOOL_NODE_ALL
+    result              = node.invoke(sub_state)
+    result["messages"].extend(rejected_msgs)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Build graph
 # ---------------------------------------------------------------------------
@@ -502,7 +600,7 @@ builder.add_node("clarify",  clarify)
 builder.add_node("rag",      rag)
 builder.add_node("web_research", web_research)
 builder.add_node("respond",              respond)
-builder.add_node("tools",               ToolNode(TOOLS))
+builder.add_node("tools",               _tools_node)
 builder.add_node("dispatch_context_override", dispatch_context_override)
 builder.add_node("dispatch_text_tools", dispatch_text_tools)
 builder.add_node("summarize",           summarize)

@@ -43,6 +43,7 @@ from prompts import (
     F_LOVENSE_CERT, F_LOVENSE_KEY,
     NUM_FIELDS,
 )
+import approval
 from graph import builder
 
 
@@ -88,6 +89,7 @@ class App:
         self._select_cursor: int       = 0
         self._select_anchor: int | None = None
         self._select_lines:  list      = []   # rendered (pair, text) lines cached by _draw_chat
+        self._approval_pending: dict | None = None   # set when agent mode needs tool approval
         self._db_path = "chat_history.db"
         self._ensure_chat_titles_table()
 
@@ -382,6 +384,9 @@ class App:
             # Draw chat-list modal on top of the active view when open
             if self._chats_modal_open:
                 self._draw_chats_modal()
+            # Draw tool-approval overlay on top of everything when in agent mode
+            if self._approval_pending is not None:
+                self._draw_approval_overlay()
             self.stdscr.refresh()
 
             key = self.stdscr.getch()
@@ -402,6 +407,15 @@ class App:
         # When the chats modal is open, it captures all keyboard input exclusively
         if self._chats_modal_open:
             return self._handle_chats_modal_key(key)
+        # Approval overlay captures Y / N / ESC exclusively
+        if self._approval_pending is not None:
+            if key in (ord('y'), ord('Y')):
+                approval.resolve(True)
+                self._approval_pending = None
+            elif key in (ord('n'), ord('N'), 27):
+                approval.resolve(False)
+                self._approval_pending = None
+            return True
         if self.view == VIEW_CHAT and not self.thinking and not self._select_mode and key == 27:
             if self._handle_chat_escape_sequence():
                 return True
@@ -409,6 +423,11 @@ class App:
             self.view = VIEW_CHAT
         elif key == curses.KEY_F2:
             self._open_chats_modal()
+        elif key == curses.KEY_F3:
+            modes = ["auto", "agent", "plan", "chat"]
+            cur = SETTINGS.get("mode", "auto")
+            SETTINGS["mode"] = modes[(modes.index(cur) + 1) % len(modes)]
+            save_settings(SETTINGS)
         elif key == curses.KEY_F5:
             if self.view == VIEW_CHAT and not self.thinking:
                 self._compact_context()
@@ -756,6 +775,57 @@ class App:
 
         return True
 
+    def _draw_approval_overlay(self) -> None:
+        """Render a centered overlay asking the user to approve or reject a tool call."""
+        if self._approval_pending is None:
+            return
+        h, w = self.stdscr.getmaxyx()
+        bar  = curses.color_pair(1)
+        name = self._approval_pending.get("name", "?")
+        args = self._approval_pending.get("args", {})
+
+        # Format args as indented key: value lines, capped to avoid overflow
+        arg_lines = []
+        for k, v in args.items():
+            line = f"  {k}: {v!r}"
+            if len(line) > w - 6:
+                line = line[:w - 9] + "..."
+            arg_lines.append(line)
+        arg_lines = arg_lines[:12]   # never overflow the screen
+
+        body = [f" Tool: {name} ", ""] + (arg_lines or ["  (no arguments)"]) + [""]
+        modal_h = min(h - 4, len(body) + 4)
+        modal_w = min(w - 4, max(40, max(len(ln) for ln in body) + 4))
+        top     = max(1, (h - modal_h) // 2)
+        left    = max(0, (w - modal_w) // 2)
+
+        for row in range(modal_h):
+            try:
+                self.stdscr.addstr(top + row, left, " " * modal_w, bar)
+            except curses.error:
+                pass
+
+        # Header
+        try:
+            hdr = f" Agent wants to call a tool "
+            self.stdscr.addstr(top, left + 1, hdr[:modal_w - 2], bar)
+        except curses.error:
+            pass
+
+        # Body lines
+        for i, line in enumerate(body[:modal_h - 2]):
+            try:
+                self.stdscr.addstr(top + 1 + i, left + 1, line[:modal_w - 2])
+            except curses.error:
+                pass
+
+        # Footer
+        footer = " [Y] Approve   [N] Reject "
+        try:
+            self.stdscr.addstr(top + modal_h - 1, left + 1, footer[:modal_w - 2], bar)
+        except curses.error:
+            pass
+
     def _draw_chats_modal(self) -> None:
         """Render a centered overlay listing all chat threads."""
         h, w = self.stdscr.getmaxyx()
@@ -971,6 +1041,7 @@ class App:
         self._last_queue_event = time.monotonic()
         self._cancel_event.clear()
         self._flush_queue()
+        approval.set_notify_queue(self._stream_queue)
         self._start_log_thread()
         self._redraw()
         threading.Thread(target=self._stream_worker, args=(text,), daemon=True).start()
@@ -1394,6 +1465,10 @@ class App:
                     _lv.deactivate()
                 except Exception:
                     pass
+            elif kind == "tool_approval_needed":
+                _, tool_name, tool_args = event
+                self._approval_pending = {"name": tool_name, "args": tool_args}
+                needs_redraw = True
             elif kind == "lovense_msg":
                 # Result from _lovense_connect() running off the UI thread.
                 self.history.append(("router", event[1]))
@@ -1583,16 +1658,30 @@ class App:
             if x + len(item) < w:
                 self.stdscr.addstr(0, x, item)
                 x += len(item) + 1
-        # Right-aligned Lovense connection indicator.
-        # Shows "Lvns:●" (connected) or "Lvns:○" (not connected) so the user
-        # can see at a glance whether a toy is paired without opening settings.
+        # Right-aligned indicators: mode badge then Lovense status
+        mode_labels = {
+            "auto":  " AUTO ",
+            "agent": " AGNT ",
+            "plan":  " PLAN ",
+            "chat":  " CHAT ",
+        }
+        lv_label = " Lvns:[--] "
         try:
             import lovense as _lv
-            connected  = _lv.is_connected()
-            lv_label   = " Lvns:[ON] " if connected else " Lvns:[--] "
-            lv_col     = max(0, w - len(lv_label) - 1)
-            self.stdscr.addstr(0, lv_col, lv_label)
+            lv_label = " Lvns:[ON] " if _lv.is_connected() else " Lvns:[--] "
         except Exception:
+            pass
+        cur_mode  = SETTINGS.get("mode", "auto")
+        mode_text = mode_labels.get(cur_mode, f" {cur_mode.upper()[:4]} ")
+        right_str = mode_text + "|" + lv_label
+        right_col = max(0, w - len(right_str) - 1)
+        self.stdscr.attroff(bar)
+        mode_colors = {"auto": 0, "agent": curses.color_pair(5), "plan": curses.color_pair(6), "chat": curses.color_pair(3)}
+        mode_attr = mode_colors.get(cur_mode, 0)
+        try:
+            self.stdscr.addstr(0, right_col, mode_text, bar | mode_attr)
+            self.stdscr.addstr(0, right_col + len(mode_text), "|" + lv_label, bar)
+        except curses.error:
             pass
         self.stdscr.attroff(bar)
 
@@ -1635,6 +1724,7 @@ class App:
             ("Navigation", [
                 ("F1",                  "Open chat view"),
                 ("F2",                  "Open / switch chat threads"),
+                ("F3",                  "Cycle mode: Auto → Agent → Plan → Chat"),
                 ("R (in Chats)",        "Regenerate the selected chat title"),
                 ("F5",                  "Compact context (summarise history)"),
                 ("F10",                 "This help screen"),

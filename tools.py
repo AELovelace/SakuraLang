@@ -192,9 +192,30 @@ def launch_app(command: str) -> str:
 
 
 @tool
+def rag_search(query: str) -> str:
+    """Search local documents and the knowledge base for relevant context.
+    Prefer this over web search — use it first whenever local docs might have the answer."""
+    from settings import SETTINGS as _S
+    cwd = _S.get("agent", {}).get("cwd", "").strip()
+    if not cwd:
+        return "[RAG: no working directory configured — set one in Settings]"
+    try:
+        import rag as rag_engine
+        rag_engine.ensure_indexed(cwd)
+        context, sources = rag_engine.retrieve(query, cwd)
+    except Exception as exc:
+        return f"[RAG error: {exc}]"
+    if not context:
+        return "[RAG: no relevant matches found]"
+    src_str = ", ".join(sources[:5])
+    return f"Sources: {src_str}\n\n{context}"
+
+
+@tool
 def brave_web_search(query: str, count: int = 5) -> str:
     """Search the public web with Brave Search and return concise JSON results.
-    Best for fresh information, recent changes, release notes, documentation, and news."""
+    Best for fresh information, recent changes, release notes, documentation, and news.
+    Prefer rag_search first — only use this when local docs don't have the answer."""
     return json.dumps(_search_brave(query, count), ensure_ascii=False, indent=2)
 
 
@@ -242,8 +263,13 @@ def code_editor(path: str, mode: str = "read", old_string: str = "", new_string:
         return f"[Error: {exc}]"
 
 
-TOOLS    = [run_powershell, run_python, launch_app, brave_web_search, write_file, code_editor]
+TOOLS    = [run_powershell, run_python, launch_app, rag_search, brave_web_search, write_file, code_editor]
 TOOL_MAP = {t.name: t for t in TOOLS}
+
+# Tools available in Plan mode — read-only, no execution or file writes.
+# rag_search is listed first so the model sees it as the preferred lookup tool.
+PLAN_TOOLS      = [rag_search, brave_web_search]
+PLAN_TOOL_NAMES = {t.name for t in PLAN_TOOLS}
 
 
 def _parse_tool_arg_string(arg_text: str) -> dict:

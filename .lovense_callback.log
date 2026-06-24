@@ -1238,3 +1238,13 @@ body: b'{"uid":"SakuraLang","appVersion":"7.95.1","toys":{"c09b9e643f7a":{"nickN
 path: /
 headers: {'Content-Type': 'application/json; charset=utf-8', 'Content-Length': '317', 'Host': 'bzz.sadgirlsclub.wtf:34569', 'Connection': 'Keep-Alive', 'Accept-Encoding': 'gzip', 'User-Agent': 'okhttp/3.14.9'}
 body: b'{"uid":"SakuraLang","appVersion":"7.95.1","toys":{"c09b9e643f7a":{"nickName":"","name":"ferri","id":"c09b9e643f7a","status":0}},"wssPort":"30013","httpPort":"20013","wsPort":"20013","appType":"remote","domain":"10-128-5-183.lovense.club","utoken":"SakuraLang","httpsPort":"30013","version":"101","platform":"android"}'
+
+--- 2026-06-24T02:33:54.170828 ---
+path: /mcp
+headers: {'Host': '68.116.17.162:34569', 'User-Agent': 'Mozilla/5.0 (compatible; Infrawatch/1.0; +https://infrawat.ch/)', 'Content-Length': '151', 'Accept': 'application/json, text/event-stream', 'Connection': 'close', 'Content-Type': 'application/json', 'Mcp-Protocol-Version': '2025-03-26', 'Accept-Encoding': 'gzip'}
+body: b'{"id":1,"jsonrpc":"2.0","method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"client","version":"0"},"protocolVersion":"2025-03-26"}}'
+
+--- 2026-06-24T02:33:54.347060 ---
+path: /
+headers: {'Host': '68.116.17.162:34569', 'User-Agent': 'Mozilla/5.0 (compatible; Infrawatch/1.0; +https://infrawat.ch/)', 'Content-Length': '151', 'Accept': 'application/json, text/event-stream', 'Connection': 'close', 'Content-Type': 'application/json', 'Mcp-Protocol-Version': '2025-03-26', 'Accept-Encoding': 'gzip'}
+body: b'{"id":1,"jsonrpc":"2.0","method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"client","version":"0"},"protocolVersion":"2025-03-26"}}'
