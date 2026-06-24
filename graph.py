@@ -366,11 +366,20 @@ def _invoke_main_agent(state: AgentState, extra_brief: str = ""):
                 )
             )]
 
-    llm = get_llm(cfg["address"]).bind_tools(TOOLS)
-    return llm.invoke([
+    messages = [
         SystemMessage(content=_build_sys_prompt(base, state)),
         *recent,
-    ])
+    ]
+    try:
+        llm = get_llm(cfg["address"]).bind_tools(TOOLS)
+        return llm.invoke(messages)
+    except Exception as exc:
+        err = str(exc)
+        if "400" in err and any(k in err for k in ("parser", "grammar", "System message")):
+            # Server can't auto-generate a tool-call grammar for this model's template.
+            # Fall back to plain LLM; text-based tool calls still work via dispatch_text_tools.
+            return get_llm(cfg["address"]).invoke(messages)
+        raise
 
 
 def respond(state: AgentState) -> dict:
@@ -379,9 +388,10 @@ def respond(state: AgentState) -> dict:
         cfg = SETTINGS["agent"]
         llm = get_llm(cfg["address"])   # no tools — pure conversation
         summary = state.get("summary", "")
-        msgs: list = [SystemMessage(content=CHAT_MODE_SYSTEM)]
+        chat_sys = CHAT_MODE_SYSTEM
         if summary:
-            msgs.append(SystemMessage(content=f"Earlier conversation summary:\n{summary}"))
+            chat_sys += f"\n\nEarlier conversation summary:\n{summary}"
+        msgs: list = [SystemMessage(content=chat_sys)]
         msgs.extend(state["messages"][-WINDOW_SIZE:])
         return {"messages": [llm.invoke(msgs)]}
     if mode == "plan":

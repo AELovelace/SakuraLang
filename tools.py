@@ -104,6 +104,44 @@ def _fallback_research_brief(results: list[dict]) -> str:
     return "Summary:\n" + "\n".join(summary_lines) + "\n\nSources:\n" + "\n".join(source_lines)
 
 
+def _fetch_webpage(url: str, max_chars: int = 8000) -> str:
+    """Fetch a URL and return cleaned plain text, truncated to max_chars."""
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; SakuraLang/1.0)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw_html = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code}: {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Network error: {exc.reason}") from exc
+
+    try:
+        import trafilatura
+        text = trafilatura.extract(raw_html, include_links=False, include_images=False)
+    except Exception:
+        text = None
+
+    if not text:
+        # stdlib fallback: strip all HTML tags
+        from html.parser import HTMLParser
+
+        class _Stripper(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.parts: list[str] = []
+            def handle_data(self, d: str):
+                self.parts.append(d)
+
+        s = _Stripper()
+        s.feed(raw_html.decode("utf-8", errors="replace"))
+        text = " ".join(s.parts)
+
+    return text[:max_chars]
+
+
 def _search_brave(query: str, count: int | None = None) -> dict:
     cfg = _get_brave_settings()
     api_key = str(cfg.get("api_key", "")).strip()
@@ -220,6 +258,17 @@ def brave_web_search(query: str, count: int = 5) -> str:
 
 
 @tool
+def browse_webpage(url: str) -> str:
+    """Fetch and read the full text content of a webpage at the given URL.
+    Use this after brave_web_search to read a result in detail.
+    Returns plain text extracted from the page (up to ~8 000 characters)."""
+    try:
+        return _fetch_webpage(url)
+    except Exception as exc:
+        return f"[Error fetching {url}: {exc}]"
+
+
+@tool
 def write_file(path: str, content: str) -> str:
     """Write text content to a file on disk.  Creates the file and any missing
     parent directories if needed; overwrites if the file already exists.
@@ -263,12 +312,12 @@ def code_editor(path: str, mode: str = "read", old_string: str = "", new_string:
         return f"[Error: {exc}]"
 
 
-TOOLS    = [run_powershell, run_python, launch_app, rag_search, brave_web_search, write_file, code_editor]
+TOOLS    = [run_powershell, run_python, launch_app, rag_search, brave_web_search, browse_webpage, write_file, code_editor]
 TOOL_MAP = {t.name: t for t in TOOLS}
 
 # Tools available in Plan mode — read-only, no execution or file writes.
 # rag_search is listed first so the model sees it as the preferred lookup tool.
-PLAN_TOOLS      = [rag_search, brave_web_search]
+PLAN_TOOLS      = [rag_search, brave_web_search, browse_webpage]
 PLAN_TOOL_NAMES = {t.name for t in PLAN_TOOLS}
 
 
