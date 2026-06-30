@@ -36,6 +36,7 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import approval
 from prompts import LOGS_URL, REMOTE_LOGS_URL
 from settings import SETTINGS, save_settings
+from thinking_stream import strip_thinking_text
 
 from .chat_worker import StreamWorker, CompactWorker, TitleWorker
 from .tools_dialog import ToolApprovalDialog
@@ -50,6 +51,7 @@ _ROLE_STYLES: dict[str, tuple[str, str, str, str]] = {
     "tool":       ("Tool",      "#b45309", "#fef3c7", "#fcd34d"),
     "rag":        ("Documents", "#2d7045", "#e8f5e9", "#a5d6a7"),
     "router":     ("System",    "#6a4a72", "#ede6ee", "#c8b0d0"),
+    "thinking":   ("Mochi thoughts", "#5f4b8b", "#eee9fb", "#c6b8ee"),
     "lovense_qr": ("Lovense",   "#7b1fa2", "#f3e5f5", "#ce93d8"),
 }
 
@@ -87,17 +89,22 @@ class MainWindow(QMainWindow):
         self.thread_id: str = self._new_thread_id()
         self.history: list[tuple[str, str]] = []
         self._ai_idx: int | None = None
+        self._thinking_idx: int | None = None
         self.thinking = False
         self._last_token_usage: dict = {}
 
-        # Lovense heat state — persists between messages until next heat tag
-        self._current_heat: float = 0.0
+        # Lovense heat/reward state — persists between messages until next tag
+        self._current_heat:   float = 0.0
+        self._current_reward: float = 0.0
         self._lv_msg.connect(lambda msg: self._handle_event(("lovense_msg", msg)))
         self._lv_qr.connect(lambda html: self._handle_event(("lovense_qr", html)))
 
         # Worker handles
         self._stream_thread: QThread | None = None
         self._stream_worker: StreamWorker | None = None
+        self._compact_thread: QThread | None = None
+        self._compact_worker: CompactWorker | None = None
+        self._title_threads: list[QThread] = []
         self._cancel_event = threading.Event()
 
         # Server inference log lines (populated by background polling threads)
@@ -116,6 +123,7 @@ class MainWindow(QMainWindow):
 
     def _load_initial_state(self):
         self._ensure_chat_titles_table()
+        self._ensure_thread_events_table()
         threads = self._list_threads()
         if threads:
             self.thread_id = threads[0]["thread_id"]
@@ -590,6 +598,51 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _ensure_thread_events_table(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS thread_events (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id  TEXT NOT NULL,
+                    role       TEXT NOT NULL,
+                    content    TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def _persist_event(self, role: str, content: str):
+        """Save a system/router message to the DB so it survives thread reloads."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "INSERT INTO thread_events (thread_id, role, content) VALUES (?, ?, ?)",
+                (self.thread_id, role, content),
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def _load_thread_events(self, thread_id: str) -> list[tuple[str, str]]:
+        """Return persisted system messages for the thread in insertion order."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT role, content FROM thread_events WHERE thread_id = ? ORDER BY id",
+                (thread_id,),
+            )
+            rows = [(r, c) for r, c in cur.fetchall()]
+            conn.close()
+            return rows
+        except Exception:
+            return []
+
     def _list_threads(self) -> list[dict]:
         try:
             conn = sqlite3.connect(self.db_path)
@@ -694,12 +747,13 @@ class MainWindow(QMainWindow):
             if isinstance(msg, HumanMessage) and content:
                 self.history.append(("user", content))
             elif isinstance(msg, AIMessage):
-                text = content if isinstance(content, str) else ""
+                text = strip_thinking_text(content) if isinstance(content, str) else ""
                 if text.strip():
                     self.history.append(("ai", text))
             elif isinstance(msg, ToolMessage) and content:
                 name = getattr(msg, "name", "tool")
                 self.history.append(("tool", f"[Tool: {name}]\n{content}"))
+        self.history.extend(self._load_thread_events(thread_id))
         self._ai_idx = None
 
     def create_new_chat(self):
@@ -709,6 +763,7 @@ class MainWindow(QMainWindow):
         self.thread_id = self._new_thread_id()
         self.history = []
         self._ai_idx = None
+        self._thinking_idx = None
         self._last_token_usage = {}
         self._monitor.clear_for_new_request()
         self._refresh_thread_list()
@@ -757,11 +812,14 @@ class MainWindow(QMainWindow):
         worker = CompactWorker(self.graph, self.thread_id)
         thread = QThread(self)
         worker.moveToThread(thread)
+        worker.finished.connect(thread.quit)
         thread.started.connect(worker.run)
         worker.event_ready.connect(self._handle_event)
-        worker.event_ready.connect(lambda ev: thread.quit() if ev[0] in ("compact_done", "error") else None)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_compact_refs)
+        self._compact_thread = thread
+        self._compact_worker = worker
         thread.start()
 
     # ── Sending messages ──────────────────────────────────────────────────
@@ -779,6 +837,7 @@ class MainWindow(QMainWindow):
 
         self.history.append(("user", text))
         self._ai_idx = None
+        self._thinking_idx = None
         self._last_token_usage = {}
         self._monitor.clear_for_new_request()
         self._render_history()
@@ -796,24 +855,44 @@ class MainWindow(QMainWindow):
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
         worker.event_ready.connect(self._handle_event)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_stream_refs)
         self._stream_thread = thread
         self._stream_worker = worker
         thread.start()
 
     def _apply_heat(self, level: float) -> None:
-        """Drive the Lovense toy to the given heat level (0.0–1.0, persistent)."""
+        """Drive toy 1 (heat toy) to the given level (0.0–1.0, persistent)."""
         self._current_heat = level
         try:
             import lovense as _lv
             if not _lv.is_connected():
                 return
+            toy_id = SETTINGS.get("lovense", {}).get("heat_toy", "")
             if level == 0.0:
-                _lv.deactivate()
+                _lv.deactivate_toy(toy_id)
             else:
-                _lv.activate(strength=round(level * 20), duration_sec=0)
+                _lv.activate_toy(toy_id, strength=round(level * 20), duration_sec=0)
+        except Exception:
+            pass
+
+    def _apply_reward(self, level: float) -> None:
+        """Drive toy 2 (reward toy) to the given level (0.0–1.0, persistent)."""
+        self._current_reward = level
+        try:
+            import lovense as _lv
+            if not _lv.is_connected():
+                return
+            toy_id = SETTINGS.get("lovense", {}).get("reward_toy", "")
+            if not toy_id:
+                return  # no reward toy assigned
+            if level == 0.0:
+                _lv.deactivate_toy(toy_id)
+            else:
+                _lv.activate_toy(toy_id, strength=round(level * 20), duration_sec=0)
         except Exception:
             pass
 
@@ -827,6 +906,7 @@ class MainWindow(QMainWindow):
         self._composer.setFocus()
         self.statusBar().showMessage("Cancelled.")
         self._apply_heat(0.0)
+        self._apply_reward(0.0)
 
     # ── Event dispatch ────────────────────────────────────────────────────
 
@@ -844,6 +924,7 @@ class MainWindow(QMainWindow):
             note, ctx = event[1], event[2]
             text = f"{note}\n{ctx}" if ctx else note
             self._monitor.add_log("rag: context retrieved")
+            self._persist_event("rag", text)
             self.history.append(("rag", text))
             self._ai_idx = None
             self._render_history()
@@ -854,6 +935,28 @@ class MainWindow(QMainWindow):
             self.history.append(("tool", f"[Tool: {name}]\n{content}"))
             self._ai_idx = None
             self._render_history()
+
+        elif kind == "thinking_note":
+            note = event[1].strip()
+            if note:
+                self._monitor.add_log(f"thinking: {note[:60]}")
+                self._insert_thinking_entry(note)
+                self._thinking_idx = None
+                self._render_history()
+
+        elif kind == "thinking_start":
+            self._monitor.add_log("thinking: streaming explicit notes")
+            self._thinking_idx = self._insert_thinking_entry(event[1])
+            self._render_history()
+
+        elif kind == "thinking_append":
+            if self._thinking_idx is not None:
+                role, prev = self.history[self._thinking_idx]
+                self.history[self._thinking_idx] = (role, prev + event[1])
+                self._render_history()
+
+        elif kind == "thinking_end":
+            self._thinking_idx = None
 
         elif kind == "plog":
             self._monitor.add_log(event[1])
@@ -872,16 +975,17 @@ class MainWindow(QMainWindow):
 
         elif kind == "ai_next":
             self._ai_idx = None
+            self._thinking_idx = None
 
         elif kind == "ai_strip_tool_calls":
             if self._ai_idx is not None:
                 role, prev = self.history[self._ai_idx]
                 from tools import TOOL_MAP
-                from prompts import HEAT_TAG_RE
+                from prompts import HEAT_TAG_RE, REWARD_TAG_RE
                 cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", prev, flags=re.DOTALL).strip()
                 tool_names = "|".join(sorted(re.escape(n) for n in TOOL_MAP))
                 cleaned = re.sub(rf"(?mis)^\s*(?:{tool_names})\s*\(.*\)\s*$", "", cleaned).strip()
-                cleaned = HEAT_TAG_RE.sub("", cleaned).strip()
+                cleaned = REWARD_TAG_RE.sub("", HEAT_TAG_RE.sub("", cleaned)).strip()
                 if cleaned:
                     self.history[self._ai_idx] = (role, cleaned)
                 else:
@@ -925,6 +1029,7 @@ class MainWindow(QMainWindow):
 
         elif kind == "compact_done":
             freed = event[1]
+            summary = event[2].strip() if len(event) > 2 and isinstance(event[2], str) else ""
             self.thinking = False
             self._cancel_btn.setVisible(False)
             self._stop_btn.setVisible(False)
@@ -932,7 +1037,16 @@ class MainWindow(QMainWindow):
             self._send_btn.setEnabled(True)
             self._composer.setFocus()
             self._ai_idx = None
-            self.history.append(("router", f"[Context compacted — {freed:,} tokens freed]"))
+            self._thinking_idx = None
+            if summary:
+                compact_note = (
+                    f"[Context compacted — {freed:,} tokens freed]\n\n"
+                    f"Checkpoint summary:\n{summary}"
+                )
+            else:
+                compact_note = f"[Context compacted — {freed:,} tokens freed]"
+            self._persist_event("router", compact_note)
+            self.history.append(("router", compact_note))
             self._render_history()
             self.statusBar().showMessage(f"Context compacted ({freed:,} tokens freed).")
 
@@ -945,18 +1059,24 @@ class MainWindow(QMainWindow):
             self._send_btn.setEnabled(True)
             self._composer.setFocus()
             self._ai_idx = None
+            self._thinking_idx = None
             self.statusBar().showMessage("Response complete.")
-            from prompts import HEAT_TAG_RE
+            from prompts import HEAT_TAG_RE, REWARD_TAG_RE
             last_heat = None
+            last_reward = None
             for role, text in reversed(self.history):
                 if role == "ai":
-                    matches = HEAT_TAG_RE.findall(text)
-                    if matches:
-                        last_heat = float(matches[-1])
+                    heat_matches = HEAT_TAG_RE.findall(text)
+                    if heat_matches:
+                        last_heat = float(heat_matches[-1])
+                    reward_matches = REWARD_TAG_RE.findall(text)
+                    if reward_matches:
+                        last_reward = float(reward_matches[-1])
                     break
             self._apply_heat(last_heat if last_heat is not None else 0.0)
+            self._apply_reward(last_reward if last_reward is not None else 0.0)
             self.history = [
-                (r, HEAT_TAG_RE.sub("", t).strip()) if r == "ai" else (r, t)
+                (r, REWARD_TAG_RE.sub("", HEAT_TAG_RE.sub("", t)).strip()) if r == "ai" else (r, t)
                 for r, t in self.history
             ]
             self._render_history()
@@ -966,6 +1086,7 @@ class MainWindow(QMainWindow):
         elif kind == "error":
             msg = event[1]
             self._monitor.add_log(f"ERR: {msg[:80]}")
+            self._persist_event("router", f"[Error: {msg}]")
             self.history.append(("router", f"[Error: {msg}]"))
             self.thinking = False
             self._cancel_btn.setVisible(False)
@@ -974,9 +1095,11 @@ class MainWindow(QMainWindow):
             self._send_btn.setEnabled(True)
             self._composer.setFocus()
             self._ai_idx = None
+            self._thinking_idx = None
             self._render_history()
             self.statusBar().showMessage(f"Error: {msg[:80]}")
             self._apply_heat(0.0)
+            self._apply_reward(0.0)
 
         elif kind == "tool_approval_needed":
             _, tool_name, tool_args = event
@@ -1039,18 +1162,44 @@ class MainWindow(QMainWindow):
         safe = safe.replace("\n", "<br>")
         return safe
 
+    def _insert_thinking_entry(self, text: str) -> int:
+        """Place thoughts before the active AI bubble, even if they arrive late."""
+        if self._ai_idx is not None and 0 <= self._ai_idx < len(self.history):
+            idx = self._ai_idx
+            self.history.insert(idx, ("thinking", text))
+            self._ai_idx += 1
+            return idx
+        self.history.append(("thinking", text))
+        return len(self.history) - 1
+
     # ── Title generation ──────────────────────────────────────────────────
 
     def _schedule_title_refresh(self, thread_id: str):
         worker = TitleWorker(self.graph, thread_id)
         thread = QThread(self)
         worker.moveToThread(thread)
+        worker.finished.connect(thread.quit)
         thread.started.connect(worker.run)
         worker.event_ready.connect(self._handle_event)
-        worker.event_ready.connect(lambda _: thread.quit())
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._release_title_thread)
+        thread._worker = worker
+        self._title_threads.append(thread)
         thread.start()
+
+    def _clear_stream_refs(self):
+        self._stream_thread = None
+        self._stream_worker = None
+
+    def _clear_compact_refs(self):
+        self._compact_thread = None
+        self._compact_worker = None
+
+    def _release_title_thread(self):
+        thread = self.sender()
+        if isinstance(thread, QThread):
+            self._title_threads = [t for t in self._title_threads if t is not thread]
 
     # ── Lovense slash commands ─────────────────────────────────────────────
 
@@ -1157,4 +1306,10 @@ class MainWindow(QMainWindow):
         if self._stream_thread is not None:
             self._stream_thread.quit()
             self._stream_thread.wait(500)
+        if self._compact_thread is not None:
+            self._compact_thread.quit()
+            self._compact_thread.wait(500)
+        for thread in list(self._title_threads):
+            thread.quit()
+            thread.wait(500)
         super().closeEvent(event)

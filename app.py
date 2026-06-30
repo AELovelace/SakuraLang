@@ -22,14 +22,16 @@ from settings import (
     STREAM_STALL_TIMEOUT_SEC,
     CHAT_RENDER_MAX_CHARS, TOOL_DISPLAY_MAX_CHARS, RAG_DISPLAY_MAX_CHARS,
 )
+from compaction import compact_messages
 from llm import get_llm, rebuild_llms
+from thinking_stream import ThinkingStreamSplitter, strip_thinking_text
 from tools import (
     TOOL_MAP,
     _contains_text_tool_call, _contains_context_override,
     _read_clipboard, _truncate_log_text, _clip_display_text,
 )
 from prompts import (
-    SUMMARIZE_PROMPT, WINDOW_SIZE, CHAT_TITLE_PROMPT,
+    WINDOW_SIZE, CHAT_TITLE_PROMPT,
     MONITOR_URL, LOGS_URL, REMOTE_MONITOR_URL, REMOTE_LOGS_URL,
     MENU, VIEW_HOME, VIEW_CHAT, VIEW_SETTINGS, VIEW_HELP,
     ROLE_PAIR, ROLE_PREFIX,
@@ -41,6 +43,7 @@ from prompts import (
     F_TITLER_ADDR, F_TITLER_PROMPT,
     F_LOVENSE_TOKEN, F_LOVENSE_UID, F_LOVENSE_PORT, F_LOVENSE_HOST,
     F_LOVENSE_CERT, F_LOVENSE_KEY,
+    F_LOVENSE_HEAT_TOY, F_LOVENSE_REWARD_TOY,
     NUM_FIELDS,
 )
 import approval
@@ -71,6 +74,7 @@ class App:
         self._stream_queue  = queue.Queue()
         self._cancel_event  = threading.Event()
         self._ai_idx: int | None = None
+        self._thinking_idx: int | None = None
         self._active_request_thread_id: str | None = None
         self._last_queue_event: float = 0.0
         self._cancelling: bool = False
@@ -90,7 +94,8 @@ class App:
         self._select_anchor: int | None = None
         self._select_lines:  list      = []   # rendered (pair, text) lines cached by _draw_chat
         self._approval_pending: dict | None = None   # set when agent mode needs tool approval
-        self._current_heat: float = 0.0
+        self._current_heat:   float = 0.0
+        self._current_reward: float = 0.0
         self._db_path = "chat_history.db"
         self._ensure_chat_titles_table()
 
@@ -121,6 +126,8 @@ class App:
             lv.get("callback_host", ""),
             lv.get("cert_file", ""),
             lv.get("key_file",  ""),
+            lv.get("heat_toy",   ""),
+            lv.get("reward_toy", ""),
         ]
 
     def _new_thread_id(self) -> str:
@@ -131,6 +138,7 @@ class App:
         self.history     = []
         self.chat_scroll = 0
         self._ai_idx     = None
+        self._thinking_idx = None
         if clear_input:
             self.input_buf    = ""
             self.input_cursor = 0
@@ -236,8 +244,8 @@ class App:
 
     @staticmethod
     def _normalize_chat_title(title: str) -> str:
-        from prompts import HEAT_TAG_RE
-        cleaned = HEAT_TAG_RE.sub("", re.sub(r"\s+", " ", title or "")).strip().strip("\"'`")
+        from prompts import HEAT_TAG_RE, REWARD_TAG_RE
+        cleaned = REWARD_TAG_RE.sub("", HEAT_TAG_RE.sub("", re.sub(r"\s+", " ", title or ""))).strip().strip("\"'`")
         cleaned = cleaned.splitlines()[0].strip() if cleaned else ""
         cleaned = re.sub(r"[.!?:;,]+$", "", cleaned)
         if len(cleaned) > 60:
@@ -246,7 +254,7 @@ class App:
         return cleaned
 
     def _build_chat_title_source(self, thread_id: str, limit: int = 3) -> str:
-        from prompts import HEAT_TAG_RE
+        from prompts import HEAT_TAG_RE, REWARD_TAG_RE
         try:
             config = {"configurable": {"thread_id": thread_id}}
             state = self.graph.get_state(config)
@@ -259,7 +267,7 @@ class App:
             content = getattr(msg, "content", "") or ""
             if not isinstance(content, str):
                 continue
-            content = HEAT_TAG_RE.sub("", content)
+            content = strip_thinking_text(REWARD_TAG_RE.sub("", HEAT_TAG_RE.sub("", content)))
             snippet = re.sub(r"\s+", " ", content).strip()
             if not snippet:
                 continue
@@ -322,6 +330,16 @@ class App:
         # Keep the log bounded so it never grows unbounded across a long session
         if len(self._pipeline_log) > 150:
             del self._pipeline_log[0]
+
+    def _insert_thinking_entry(self, text: str) -> int:
+        """Place thoughts before the active AI bubble, even if they arrive late."""
+        if self._ai_idx is not None and 0 <= self._ai_idx < len(self.history):
+            idx = self._ai_idx
+            self.history.insert(idx, ("thinking", text))
+            self._ai_idx += 1
+            return idx
+        self.history.append(("thinking", text))
+        return len(self.history) - 1
 
     def run(self):
         curses.curs_set(1)
@@ -624,6 +642,8 @@ class App:
         SETTINGS["lovense"]["callback_host"] = self.settings_bufs[F_LOVENSE_HOST]
         SETTINGS["lovense"]["cert_file"]     = self.settings_bufs[F_LOVENSE_CERT]
         SETTINGS["lovense"]["key_file"]      = self.settings_bufs[F_LOVENSE_KEY]
+        SETTINGS["lovense"]["heat_toy"]      = self.settings_bufs[F_LOVENSE_HEAT_TOY]
+        SETTINGS["lovense"]["reward_toy"]    = self.settings_bufs[F_LOVENSE_REWARD_TOY]
         save_settings(SETTINGS)
         rebuild_llms()
         # Also restart the callback server with updated cert/key if port changed.
@@ -727,7 +747,7 @@ class App:
                     self.history.append(("user", content))
                 elif isinstance(msg, AIMessage):
                     # content can be a string; skip pure tool-call messages with no text
-                    text = content if isinstance(content, str) else ""
+                    text = strip_thinking_text(content) if isinstance(content, str) else ""
                     if text.strip():
                         self.history.append(("ai", text))
                 elif isinstance(msg, ToolMessage) and content:
@@ -1044,6 +1064,7 @@ class App:
         self._log_lines       = []
         self._pipeline_log    = []                # fresh log for each new request
         self._ai_idx          = None
+        self._thinking_idx    = None
         self._last_token_usage = {}               # reset so bar shows "waiting..." until new data arrives
         self._last_queue_event = time.monotonic()
         self._cancel_event.clear()
@@ -1156,16 +1177,34 @@ class App:
             self.history.append(("router", f"[Lovense] Test failed: {exc}"))
 
     def _apply_heat(self, level: float) -> None:
-        """Drive the Lovense toy to the given heat level (0.0–1.0, persistent)."""
+        """Drive toy 1 (heat toy) to the given level (0.0–1.0, persistent)."""
         self._current_heat = level
         try:
             import lovense as _lv
             if not _lv.is_connected():
                 return
+            toy_id = SETTINGS.get("lovense", {}).get("heat_toy", "")
             if level == 0.0:
-                _lv.deactivate()
+                _lv.deactivate_toy(toy_id)
             else:
-                _lv.activate(strength=round(level * 20), duration_sec=0)
+                _lv.activate_toy(toy_id, strength=round(level * 20), duration_sec=0)
+        except Exception:
+            pass
+
+    def _apply_reward(self, level: float) -> None:
+        """Drive toy 2 (reward toy) to the given level (0.0–1.0, persistent)."""
+        self._current_reward = level
+        try:
+            import lovense as _lv
+            if not _lv.is_connected():
+                return
+            toy_id = SETTINGS.get("lovense", {}).get("reward_toy", "")
+            if not toy_id:
+                return  # no reward toy assigned
+            if level == 0.0:
+                _lv.deactivate_toy(toy_id)
+            else:
+                _lv.activate_toy(toy_id, strength=round(level * 20), duration_sec=0)
         except Exception:
             pass
 
@@ -1206,7 +1245,9 @@ class App:
         q.put(("plog", f"request: {_truncate_log_text(text, 120)}"))
         try:
             pending_ai  = False
+            pending_thinking = False
             first_chunk = False   # gate for the 'ai: first token' log entry
+            splitter = ThinkingStreamSplitter()
             q.put(("plog", "graph: opening stream"))
             for item in self.graph.stream(
                 {"messages": [HumanMessage(content=text)]},
@@ -1225,13 +1266,16 @@ class App:
                         if node_name == "classify" and update.get("routing_note"):
                             q.put(("classify", update["routing_note"]))
                             q.put(("plog", f"classify: {update['routing_note']}"))
+                            q.put(("thinking_note", f"Routing decision: {update['routing_note']}"))
                         elif node_name == "web_research":
                             query = update.get("web_query", "")
                             result_count = len(update.get("web_results", []) or [])
                             note = update.get("routing_note", "")
                             if query:
                                 q.put(("plog", f"web: query={_truncate_log_text(query, 90)}"))
+                                q.put(("thinking_note", f"Using web research query: {query}"))
                             q.put(("plog", f"web: results={result_count}"))
+                            q.put(("thinking_note", f"Web research returned {result_count} result(s)."))
                             if note:
                                 idx = note.rfind("[Web")
                                 web_note = note[idx:] if idx != -1 else note
@@ -1246,6 +1290,7 @@ class App:
                             rag_note = note[idx:] if idx != -1 else "[RAG]"
                             q.put(("rag", rag_note, ctx))
                             q.put(("plog", f"rag: context chars={len(ctx)}"))
+                            q.put(("thinking_note", f"Checked local documents: {rag_note}"))
                         elif node_name in ("respond", "clarify"):
                             q.put(("plog", f"{node_name}: model returned update"))
                             for msg in update.get("messages", []):
@@ -1254,6 +1299,7 @@ class App:
                                 if tool_calls:
                                     tool_names = ", ".join(tc.get("name", "tool") for tc in tool_calls)
                                     q.put(("plog", f"{node_name}: tool_calls={tool_names}"))
+                                    q.put(("thinking_note", f"Decided to call tool(s): {tool_names}"))
                                 elif content:
                                     q.put(("plog", f"{node_name}: text chars={len(str(content))}"))
                                 usage = getattr(msg, "usage_metadata", None)
@@ -1271,19 +1317,28 @@ class App:
                         elif node_name == "tools":
                             q.put(("plog", f"tools: received {len(update.get('messages', []))} message(s)"))
                             for msg in update.get("messages", []):
-                                q.put(("tool", getattr(msg, "name", "tool"), getattr(msg, "content", "")))
+                                name = getattr(msg, "name", "tool")
+                                q.put(("tool", name, getattr(msg, "content", "")))
+                                q.put(("thinking_note", f"Tool finished: {name}"))
                             q.put(("ai_next",))
                             pending_ai = False
                         elif node_name == "dispatch_context_override":
                             q.put(("plog", "dispatch_context_override: rerouting request"))
+                            mode_name = update.get("context_override_mode", "context")
+                            reason = update.get("context_override_reason", "").strip()
+                            detail = f" ({reason})" if reason else ""
+                            q.put(("thinking_note", f"Need {mode_name} context before answering{detail}."))
                             q.put(("ai_strip_context_override",))
                             q.put(("ai_next",))
                             pending_ai = False
                         elif node_name == "dispatch_text_tools":
                             q.put(("plog", f"dispatch_text_tools: received {len(update.get('messages', []))} message(s)"))
+                            q.put(("thinking_note", f"Parsed {len(update.get('messages', []))} text tool result(s)."))
                             q.put(("ai_strip_tool_calls",))
                             for msg in update.get("messages", []):
-                                q.put(("tool", getattr(msg, "name", "tool"), getattr(msg, "content", "")))
+                                name = getattr(msg, "name", "tool")
+                                q.put(("tool", name, getattr(msg, "content", "")))
+                                q.put(("thinking_note", f"Tool finished: {name}"))
                             q.put(("ai_next",))
                             pending_ai = False
 
@@ -1302,8 +1357,27 @@ class App:
                             if not first_chunk:
                                 first_chunk = True
                                 q.put(("plog", f"ai: first token from {metadata.get('langgraph_node', 'unknown')}"))
-                            q.put(("ai_start", content) if not pending_ai else ("ai_append", content))
-                            pending_ai = True
+                            for part_kind, part_text in splitter.feed(content):
+                                if part_kind == "thinking":
+                                    q.put(("thinking_start", part_text) if not pending_thinking else ("thinking_append", part_text))
+                                    pending_thinking = True
+                                elif part_kind == "thinking_end":
+                                    q.put(("thinking_end",))
+                                    pending_thinking = False
+                                elif part_kind == "answer":
+                                    q.put(("ai_start", part_text) if not pending_ai else ("ai_append", part_text))
+                                    pending_ai = True
+
+            for part_kind, part_text in splitter.finish():
+                if part_kind == "thinking":
+                    q.put(("thinking_start", part_text) if not pending_thinking else ("thinking_append", part_text))
+                    pending_thinking = True
+                elif part_kind == "thinking_end":
+                    q.put(("thinking_end",))
+                    pending_thinking = False
+                elif part_kind == "answer":
+                    q.put(("ai_start", part_text) if not pending_ai else ("ai_append", part_text))
+                    pending_ai = True
 
         except Exception as exc:
             q.put(("error", str(exc)))
@@ -1382,6 +1456,24 @@ class App:
                 self.history.append(("tool", f"[Tool: {event[1]}]\n{tool_content}"))
                 self._ai_idx = None
                 needs_redraw = True
+            elif kind == "thinking_note":
+                note = event[1].strip()
+                if note:
+                    self._plog(f"thinking: {_truncate_log_text(note, 70)}")
+                    self._insert_thinking_entry(note)
+                    self._thinking_idx = None
+                    needs_redraw = True
+            elif kind == "thinking_start":
+                self._plog("thinking: streaming explicit notes")
+                self._thinking_idx = self._insert_thinking_entry(event[1])
+                needs_redraw = True
+            elif kind == "thinking_append":
+                if self._thinking_idx is not None:
+                    role, prev = self.history[self._thinking_idx]
+                    self.history[self._thinking_idx] = (role, prev + event[1])
+                    needs_redraw = True
+            elif kind == "thinking_end":
+                self._thinking_idx = None
             elif kind == "plog":
                 # Timestamped log events emitted by the background stream worker.
                 self._plog(event[1])
@@ -1397,6 +1489,7 @@ class App:
                     needs_redraw = True
             elif kind == "ai_next":
                 self._ai_idx = None
+                self._thinking_idx = None
             elif kind == "ai_strip_tool_calls":
                 if self._ai_idx is not None:
                     role, prev = self.history[self._ai_idx]
@@ -1445,28 +1538,43 @@ class App:
                         pass
             elif kind == "compact_done":
                 self._plog(f"compact: {event[1]:,} tokens freed")
+                summary = event[2].strip() if len(event) > 2 and isinstance(event[2], str) else ""
                 self.thinking    = False
                 self._cancelling = False
                 self._ai_idx     = None
-                self.history.append(("router", f"[Context compacted — {event[1]:,} tokens freed]"))
+                self._thinking_idx = None
+                if summary:
+                    compact_note = (
+                        f"[Context compacted — {event[1]:,} tokens freed]\n\n"
+                        f"Checkpoint summary:\n{summary}"
+                    )
+                else:
+                    compact_note = f"[Context compacted — {event[1]:,} tokens freed]"
+                self.history.append(("router", compact_note))
                 needs_redraw = True
             elif kind == "done":
                 self._plog("done ✓")
                 self.thinking    = False
                 self._cancelling = False
                 self._ai_idx     = None
+                self._thinking_idx = None
                 needs_redraw     = True
-                from prompts import HEAT_TAG_RE
+                from prompts import HEAT_TAG_RE, REWARD_TAG_RE
                 last_heat = None
+                last_reward = None
                 for role, text in reversed(self.history):
                     if role == "ai":
-                        matches = HEAT_TAG_RE.findall(text)
-                        if matches:
-                            last_heat = float(matches[-1])
+                        heat_matches = HEAT_TAG_RE.findall(text)
+                        if heat_matches:
+                            last_heat = float(heat_matches[-1])
+                        reward_matches = REWARD_TAG_RE.findall(text)
+                        if reward_matches:
+                            last_reward = float(reward_matches[-1])
                         break
                 self._apply_heat(last_heat if last_heat is not None else 0.0)
+                self._apply_reward(last_reward if last_reward is not None else 0.0)
                 self.history = [
-                    (r, HEAT_TAG_RE.sub("", t).strip()) if r == "ai" else (r, t)
+                    (r, REWARD_TAG_RE.sub("", HEAT_TAG_RE.sub("", t)).strip()) if r == "ai" else (r, t)
                     for r, t in self.history
                 ]
                 if self._active_request_thread_id:
@@ -1478,9 +1586,11 @@ class App:
                 self.thinking    = False
                 self._cancelling = False
                 self._ai_idx     = None
+                self._thinking_idx = None
                 self._active_request_thread_id = None
                 needs_redraw     = True
                 self._apply_heat(0.0)
+                self._apply_reward(0.0)
             elif kind == "tool_approval_needed":
                 _, tool_name, tool_args = event
                 pre_heat = self._current_heat
@@ -1528,34 +1638,36 @@ class App:
             config = {"configurable": {"thread_id": self.thread_id}}
             state  = self.graph.get_state(config=config)
             messages = list(state.values.get("messages", []))
-            if not messages:
-                q.put(("compact_done", 0))
+            if len(messages) <= WINDOW_SIZE:
+                q.put(("compact_done", 0, ""))
                 return
 
             existing = state.values.get("summary", "")
-            prefix   = f"Previous summary:\n{existing}\n\nNew messages:\n" if existing else ""
-            history_text = "\n".join(
-                f"{m.__class__.__name__}: {getattr(m, 'content', '')}"
-                for m in messages
-            )
             cfg      = SETTINGS["agent"]
-            response = get_llm(cfg["address"], streaming=False).invoke([
-                SystemMessage(content=SUMMARIZE_PROMPT),
-                HumanMessage(content=prefix + history_text),
-            ])
-            new_summary = response.content if isinstance(response.content, str) else ""
-
-            # Estimate tokens freed (rough character-based count)
-            freed = sum(len(getattr(m, "content", "") or "") for m in messages) // 4
+            llm = get_llm(cfg["address"], streaming=False, timeout=None)
+            q.put(("plog", f"compact: keeping latest {WINDOW_SIZE} messages"))
+            new_summary, removed_messages, freed, batch_count = compact_messages(
+                messages,
+                existing,
+                llm,
+                progress=lambda i, total, count: q.put((
+                    "plog",
+                    f"compact: summarizing batch {i}/{total} ({count} messages)",
+                )),
+            )
+            if not removed_messages:
+                q.put(("compact_done", 0, ""))
+                return
 
             self.graph.update_state(
                 config=config,
                 values={
                     "summary":  new_summary,
-                    "messages": [RemoveMessage(id=m.id) for m in messages],
+                    "messages": [RemoveMessage(id=m.id) for m in removed_messages],
                 },
             )
-            q.put(("compact_done", freed))
+            q.put(("plog", f"compact: applied {batch_count} summary batch(es)"))
+            q.put(("compact_done", freed, new_summary))
         except Exception as exc:
             q.put(("error", f"Compact failed: {exc}"))
 
@@ -1916,9 +2028,14 @@ class App:
         y += 2
         # TLS cert files from certbot (certonly --standalone -d bzz.sadgirlsclub.wtf).
         # Default certbot paths: C:\Certbot\live\<domain>\fullchain.pem + privkey.pem
-        self._draw_field(y, "  TLS Cert File: ", F_LOVENSE_CERT,  LABEL_W, field_w, multiline=False)
+        self._draw_field(y, "  TLS Cert File: ", F_LOVENSE_CERT,      LABEL_W, field_w, multiline=False)
         y += 2
-        self._draw_field(y, "  TLS Key File:  ", F_LOVENSE_KEY,   LABEL_W, field_w, multiline=False)
+        self._draw_field(y, "  TLS Key File:  ", F_LOVENSE_KEY,       LABEL_W, field_w, multiline=False)
+        y += 2
+        # Toy IDs for <heat> and <reward> tags. Use /lovense status to find toy IDs.
+        self._draw_field(y, "  Heat Toy ID:   ", F_LOVENSE_HEAT_TOY,  LABEL_W, field_w, multiline=False)
+        y += 2
+        self._draw_field(y, "  Reward Toy ID: ", F_LOVENSE_REWARD_TOY, LABEL_W, field_w, multiline=False)
         y += 2
 
         footer = "  Tab: field   ↑↓ (prompt): line / (addr): field   ←→/Home/End: cursor   Enter: newline   ESC: save"

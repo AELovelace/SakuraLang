@@ -7,10 +7,12 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 
 import approval
+from compaction import compact_messages
 import security
 from settings import SETTINGS
 from state import AgentState
 from llm import get_llm
+from thinking_stream import strip_thinking_text
 from tools import (
     TOOLS, TOOL_MAP, PLAN_TOOLS, PLAN_TOOL_NAMES,
     _contains_text_tool_call, _contains_context_override,
@@ -22,12 +24,24 @@ from prompts import (
     CLASSIFIER_SYSTEM, DOMAIN_PROMPTS, RESEARCHER_SYSTEM,
     AGENT_CONTEXT_OVERRIDE_PROMPT,
     CONFIDENCE_THRESHOLD, WINDOW_SIZE, SUMMARIZE_THRESHOLD,
-    SUMMARIZE_PROMPT, QUERY_REWRITE_PROMPT, WEB_QUERY_REWRITE_PROMPT,
+    QUERY_REWRITE_PROMPT, WEB_QUERY_REWRITE_PROMPT,
     WEB_RESEARCH_BRIEF_PROMPT,
     CLASSIFIER_RETRY_MSG, CLASSIFIER_CONFIDENCE_RETRY_MSG,
     CHAT_MODE_SYSTEM, PLAN_MODE_SYSTEM,
     HEAT_INSTRUCTION,
 )
+
+
+def _strip_response_thinking(response):
+    content = getattr(response, "content", "")
+    if isinstance(content, str):
+        cleaned = strip_thinking_text(content)
+        if cleaned != content:
+            try:
+                return response.model_copy(update={"content": cleaned})
+            except AttributeError:
+                response.content = cleaned
+    return response
 
 
 def _last_user_text(state: AgentState) -> str:
@@ -169,8 +183,9 @@ def clarify(state: AgentState) -> dict:
     )
     response = get_llm(cfg["address"]).bind_tools(TOOLS).invoke([
         SystemMessage(content=_build_sys_prompt(base + "\n\n" + AGENT_CONTEXT_OVERRIDE_PROMPT, state)),
-        *state["messages"][-WINDOW_SIZE:],
+        *state["messages"],
     ])
+    response = _strip_response_thinking(response)
     conf = state.get("confidence", 0.0)
     return {
         "messages":     [response],
@@ -354,7 +369,7 @@ def _invoke_main_agent(state: AgentState, extra_brief: str = ""):
             + security.wrap_as_data(safe_brief, "web_research")
         )
 
-    recent = list(state["messages"][-WINDOW_SIZE:])
+    recent = list(state["messages"])
 
     # When the tail of the conversation is one or more ToolMessages the model
     # already ran a tool.  Local models (llama.cpp) often produce an empty
@@ -404,16 +419,16 @@ def respond(state: AgentState) -> dict:
         if summary:
             chat_sys += f"\n\nEarlier conversation summary:\n{summary}"
         msgs: list = [SystemMessage(content=chat_sys)]
-        msgs.extend(state["messages"][-WINDOW_SIZE:])
-        return {"messages": [llm.invoke(msgs)]}
+        msgs.extend(state["messages"])
+        return {"messages": [_strip_response_thinking(llm.invoke(msgs))]}
     if mode == "plan":
         cfg = SETTINGS["agent"]
         # Plan mode gets web search only — no shell, no file writes.
         llm = get_llm(cfg["address"]).bind_tools(PLAN_TOOLS)
         summary = state.get("summary", "")
         msgs: list = [SystemMessage(content=_build_sys_prompt(PLAN_MODE_SYSTEM, state))]
-        msgs.extend(state["messages"][-WINDOW_SIZE:])
-        response = llm.invoke(msgs)
+        msgs.extend(state["messages"])
+        response = _strip_response_thinking(llm.invoke(msgs))
         research_brief = state.get("research_brief", "").strip()
         content = response.content if isinstance(response.content, str) else ""
         keep_brief = bool(getattr(response, "tool_calls", None)) or _contains_text_tool_call(content)
@@ -434,12 +449,13 @@ def respond(state: AgentState) -> dict:
         llm    = get_llm(cfg["address"], timeout=120)
         resp   = llm.invoke([
             SystemMessage(content=_build_sys_prompt(base, state)),
-            *state["messages"][-WINDOW_SIZE:],
+            *state["messages"],
         ])
+        resp = _strip_response_thinking(resp)
         # Clear the context so it isn't reused on the next turn.
         return {"messages": [resp], "rag_context": ""}
 
-    response = _invoke_main_agent(state)
+    response = _strip_response_thinking(_invoke_main_agent(state))
     content = response.content if isinstance(response.content, str) else ""
     for warning in security.check_output(content):
         import logging as _logging
@@ -457,24 +473,16 @@ def summarize(state: AgentState) -> dict:
     if len(messages) <= SUMMARIZE_THRESHOLD:
         return {}
 
-    to_compress = messages[:-WINDOW_SIZE]
     cfg         = SETTINGS["agent"]
     existing    = state.get("summary", "")
-    prefix      = f"Previous summary:\n{existing}\n\nNew messages to incorporate:\n" if existing else ""
-    history_text = "\n".join(
-        f"{m.__class__.__name__}: {getattr(m, 'content', '')}"
-        for m in to_compress
+    new_summary, to_compress, _, _ = compact_messages(
+        messages,
+        existing,
+        get_llm(cfg["address"], streaming=False, timeout=None),
+        keep_recent=WINDOW_SIZE,
     )
-
-    response = get_llm(cfg["address"], streaming=False).invoke([
-        SystemMessage(content=SUMMARIZE_PROMPT),
-        HumanMessage(content=prefix + history_text),
-    ])
-    new_summary = response.content if isinstance(response.content, str) else ""
-    for warning in security.check_output(new_summary):
-        import logging as _logging
-        _logging.getLogger("security").warning("[security] %s in conversation summary", warning)
-    new_summary = security.sanitize_external(new_summary)
+    if not to_compress:
+        return {}
 
     return {
         "summary":  new_summary,

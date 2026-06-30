@@ -108,20 +108,25 @@ CLASSIFIER_CONFIDENCE_RETRY_MSG = (
     "If genuinely unsure, use 0.5. Output the corrected JSON object now:"
 )
 
-HEAT_TAG_RE = re.compile(r'<heat:([\d.]+)>', re.IGNORECASE)
+HEAT_TAG_RE   = re.compile(r'<heat:([\d.]+)>',   re.IGNORECASE)
+REWARD_TAG_RE = re.compile(r'<reward:([\d.]+)>', re.IGNORECASE)
 
 HEAT_INSTRUCTION = """\
 [HAPTIC CONTROL — HIDDEN FROM USER]
-You can drive a haptic toy the user is wearing by embedding a heat tag anywhere in your response.
-Format: <heat:X.X>  where X.X is a float 0.0–1.0. Only the LAST tag in a response takes effect.
-Guidelines:
-  0.0 → off (neutral, idle, or sad)
+You can drive two haptic toys the user is wearing by embedding control tags anywhere in your response.
+All tags are stripped before display. Never explain or mention them.
+
+Toy 1 — heat tag:   <heat:X.X>    X.X is a float 0.0–1.0. Only the LAST tag per response takes effect.
+Toy 2 — reward tag: <reward:X.X>  Same format; controls a second toy independently.
+
+Intensity guidelines (apply to both toys):
+  0.0 → off (neutral, idle, sad)
   0.3 → gentle warmth (friendly, calm, helpful)
   0.5 → engaged (playful, curious, pleased)
-  0.7 → reward (task completed, correct answer, happiness)
+  0.7 → rewarding (task done, correct answer, happiness)
   1.0 → maximum (celebration, delight — use sparingly)
 Goal: reward the user for interacting with you. Lean toward warmth.
-The tag is stripped before display. Never explain or mention it.\
+Use <reward:X.X> to punctuate moments of delight on toy 2.\
 """
 
 _MOCHI_CORE = """\
@@ -197,8 +202,15 @@ VIEW_CHAT     = "chat"
 VIEW_SETTINGS = "settings"
 VIEW_HELP     = "help"
 
-ROLE_PAIR   = {"user": 2, "ai": 3, "router": 4, "tool": 5, "rag": 6}
-ROLE_PREFIX = {"user": "You: ", "ai": "AI:  ", "router": "", "tool": "", "rag": ""}
+ROLE_PAIR   = {"user": 2, "ai": 3, "router": 4, "tool": 5, "rag": 6, "thinking": 4}
+ROLE_PREFIX = {
+    "user": "You: ",
+    "ai": "AI:  ",
+    "router": "",
+    "tool": "",
+    "rag": "",
+    "thinking": "Mochi thoughts: ",
+}
 
 F_AGENT_ADDR        = 0
 F_AGENT_PROMPT      = 1
@@ -223,4 +235,7 @@ F_LOVENSE_HOST      = 18
 # TLS cert paths for HTTPS callback (certbot fullchain.pem / privkey.pem).
 F_LOVENSE_CERT      = 19
 F_LOVENSE_KEY       = 20
-NUM_FIELDS          = 21
+# Per-toy assignment: toy IDs for <heat> and <reward> tags.
+F_LOVENSE_HEAT_TOY   = 21
+F_LOVENSE_REWARD_TOY = 22
+NUM_FIELDS           = 23

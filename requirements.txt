@@ -2,6 +2,7 @@ langchain-openai
 langgraph
 langgraph-checkpoint-sqlite
 windows-curses; sys_platform == "win32"
+PyQt6
 
 # Hybrid RAG agent (rag.py) — local indexing + dense/sparse retrieval + reranking
 langchain

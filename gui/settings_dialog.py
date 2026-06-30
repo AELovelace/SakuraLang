@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Tabbed settings dialog mirroring the 21-field TUI settings form (F12)."""
+"""Tabbed settings dialog mirroring the 23-field TUI settings form (F12)."""
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit,
-    QPlainTextEdit, QTabWidget, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPlainTextEdit, QPushButton, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from settings import SETTINGS, DEFAULT_SETTINGS, save_settings
@@ -90,6 +91,13 @@ class SettingsDialog(QDialog):
         self.lv_cert  = _line(lv.get("cert_file",         ""))
         self.lv_key   = _line(lv.get("key_file",          ""))
 
+        # Toy pickers — combo boxes populated from connected toy list
+        self.lv_heat_combo   = QComboBox()
+        self.lv_reward_combo = QComboBox()
+        self._saved_heat_toy   = lv.get("heat_toy",   "")
+        self._saved_reward_toy = lv.get("reward_toy", "")
+        self._populate_toy_combos()
+
         tabs = QTabWidget()
         tabs.addTab(_tab([
             ("Address",        self.agent_addr),
@@ -116,6 +124,20 @@ class SettingsDialog(QDialog):
             ("Search language",self.brave_lang),
             ("Safe search",    self.brave_safesearch),
         ]), "Brave Search")
+        # Toy picker row: combo + refresh button side by side
+        heat_row = QWidget()
+        heat_layout = QHBoxLayout(heat_row)
+        heat_layout.setContentsMargins(0, 0, 0, 0)
+        heat_layout.addWidget(self.lv_heat_combo, 1)
+
+        reward_row = QWidget()
+        reward_layout = QHBoxLayout(reward_row)
+        reward_layout.setContentsMargins(0, 0, 0, 0)
+        reward_layout.addWidget(self.lv_reward_combo, 1)
+
+        refresh_btn = QPushButton("Refresh toy list")
+        refresh_btn.clicked.connect(self._populate_toy_combos)
+
         tabs.addTab(_tab([
             ("Dev token",      self.lv_token),
             ("User ID",        self.lv_uid),
@@ -123,6 +145,9 @@ class SettingsDialog(QDialog):
             ("Callback host",  self.lv_host),
             ("TLS cert file",  self.lv_cert),
             ("TLS key file",   self.lv_key),
+            ("Heat toy (toy 1)",   heat_row),
+            ("Reward toy (toy 2)", reward_row),
+            ("",               refresh_btn),
         ]), "Lovense")
 
         buttons = QDialogButtonBox(
@@ -138,6 +163,29 @@ class SettingsDialog(QDialog):
         ))
         layout.addWidget(tabs, 1)
         layout.addWidget(buttons)
+
+    def _populate_toy_combos(self) -> None:
+        """Rebuild the heat/reward combo boxes from currently connected toys."""
+        try:
+            import lovense as _lv
+            toys = _lv.get_toys()  # [{"id": str, "name": str}]
+        except Exception:
+            toys = []
+
+        for combo, none_label, saved_id in (
+            (self.lv_heat_combo,   "All toys (default)", self._saved_heat_toy),
+            (self.lv_reward_combo, "None (disabled)",    self._saved_reward_toy),
+        ):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem(none_label, "")  # empty string = not assigned
+            for toy in toys:
+                display = f"{toy['name']}  [{toy['id']}]"
+                combo.addItem(display, toy["id"])
+            # Re-select the previously saved toy if it's still in the list
+            idx = combo.findData(saved_id)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
 
     def _save_and_accept(self):
         SETTINGS["agent"]["address"]       = self.agent_addr.text().strip()
@@ -166,6 +214,8 @@ class SettingsDialog(QDialog):
         SETTINGS["lovense"]["callback_host"] = self.lv_host.text().strip()
         SETTINGS["lovense"]["cert_file"]     = self.lv_cert.text().strip()
         SETTINGS["lovense"]["key_file"]      = self.lv_key.text().strip()
+        SETTINGS["lovense"]["heat_toy"]      = self.lv_heat_combo.currentData() or ""
+        SETTINGS["lovense"]["reward_toy"]    = self.lv_reward_combo.currentData() or ""
 
         save_settings(SETTINGS)
         rebuild_llms()

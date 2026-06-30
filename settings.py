@@ -38,6 +38,8 @@ DEFAULT_SETTINGS = {
     # token / uid come from https://www.lovense.com/user/developer/info.
     # callback_port: the port this app listens on for the toy-pairing POST.
     # callback_host: LAN IP shown in the pairing URL (blank = auto-detect).
+    # heat_toy: toy ID for <heat> tags (blank = all connected toys).
+    # reward_toy: toy ID for <reward> tags (blank = disabled).
     "lovense": {
         "token":         "",
         "uid":           "",
@@ -45,6 +47,8 @@ DEFAULT_SETTINGS = {
         "callback_host": "",
         "cert_file":     "",
         "key_file":      "",
+        "heat_toy":      "",
+        "reward_toy":    "",
     },
 }
 

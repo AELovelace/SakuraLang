@@ -442,6 +442,89 @@ def get_toy_names() -> list[str]:
         return names
 
 
+def get_toys() -> list[dict]:
+    """Return a list of connected toys as [{"id": str, "name": str}]."""
+    with _lock:
+        result = []
+        for tid, info in _toys.items():
+            nick = (info.get("nickName") or "").strip()
+            name = info.get("name", tid)
+            result.append({"id": tid, "name": nick if nick else name})
+        return result
+
+
+def activate_toy(toy_id: str = "", strength: int = 10, duration_sec: float = 0) -> None:
+    """
+    Vibrate a specific toy (or all toys if toy_id is empty).
+
+    toy_id       — Lovense toy ID string; empty string targets all connected toys
+    strength     — vibration level 0-20
+    duration_sec — how long to run; 0 = indefinite
+    """
+    with _lock:
+        domain = _toy_domain
+        port   = _toy_port
+        uid    = _uid
+        token  = _dev_token
+
+    if not (domain and port):
+        return
+
+    cmd: dict = {
+        "command": "Function",
+        "action":  f"Vibrate:{strength}",
+        "timeSec": duration_sec,
+        "apiVer":  1,
+    }
+    if toy_id:
+        cmd["toy"] = toy_id
+
+    local_payload = json.dumps(cmd).encode()
+
+    server_cmd = {**cmd, "token": token, "uid": uid}
+    server_payload = json.dumps(server_cmd).encode()
+
+    threading.Thread(
+        target=_send_command,
+        args=(domain, port, local_payload, server_payload, token, uid),
+        daemon=True,
+        name="lovense-activate-toy",
+    ).start()
+
+
+def deactivate_toy(toy_id: str = "") -> None:
+    """Stop a specific toy (or all toys if toy_id is empty)."""
+    with _lock:
+        domain = _toy_domain
+        port   = _toy_port
+        uid    = _uid
+        token  = _dev_token
+
+    if not (domain and port):
+        return
+
+    cmd: dict = {
+        "command": "Function",
+        "action":  "Stop",
+        "timeSec": 0,
+        "apiVer":  1,
+    }
+    if toy_id:
+        cmd["toy"] = toy_id
+
+    local_payload = json.dumps(cmd).encode()
+
+    server_cmd = {**cmd, "token": token, "uid": uid}
+    server_payload = json.dumps(server_cmd).encode()
+
+    threading.Thread(
+        target=_send_command,
+        args=(domain, port, local_payload, server_payload, token, uid),
+        daemon=True,
+        name="lovense-deactivate-toy",
+    ).start()
+
+
 def activate(strength: int = 10, duration_sec: float = 0) -> None:
     """
     Start vibrating all connected toys.
